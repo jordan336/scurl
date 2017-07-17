@@ -1,0 +1,361 @@
+#!/usr/bin/env python2
+#
+# scurl
+# Jordan Ebel - jebel
+
+import sys
+import argparse
+from argparse import SUPPRESS
+import urlparse
+import OpenSSL
+import socket
+import datetime
+import re
+
+
+DIGEST_ALGORITHM = 'sha256'
+DEFAULT_CIPHER_LIST = 'ALL:!EXPORT:!EXPORT40:!EXPORT56:!aNULL:!LOW:!RC4:@STRENGTH'
+SINGLE_ALLOWED_ARGS = ['-v', '-h', '-3']
+DOUBLE_ALLOWED_ARGS = ['--tlsv1.0', '--tlsv1.1', '--tlsv1.2', '--sslv3', '--ciphers', '--crlfile', '--cacert', '--allow-stale-certs', '--pinnedpublickey']
+
+
+def print_stderr(msg):
+    print >>sys.stderr, msg
+
+
+# timestamp: YYYYMMDDhhmmssZ
+def get_datetime(timestamp):
+    year = int(timestamp[0:4])
+    month = int(timestamp[4:6])
+    day = int(timestamp[6:8])
+    hour = int(timestamp[8:10])
+    minute = int(timestamp[10:12])
+    second = int(timestamp[12:14])
+
+    date = datetime.datetime(year, month, day, hour, minute, second)
+
+    if '+' in timestamp:
+        offset_hour = int(timestamp[15:17])
+        offset_min = int(timestamp[17:])
+        return date + datetime.timedelta(hours=offset_hour, minutes=offset_min)
+
+    elif '-' in timestamp:
+        offset_hour = int(timestamp[15:17])
+        offset_min = int(timestamp[17:])
+        return date - datetime.timedelta(hours=offset_hour, minutes=offset_min)
+
+    return date
+
+
+def get_certificate(filename):
+    f = open(filename, 'r')
+    buf = f.read()
+    return OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, buf)
+
+
+def get_crl_file(filename):
+    f = open(filename, 'r')
+    buf = f.read()
+    return OpenSSL.crypto.load_crl(OpenSSL.crypto.FILETYPE_PEM, buf)
+
+
+def cert_in_crl_file(cert, crl_file):
+    if crl_file is None or crl_file.get_revoked() is None:
+        return False
+
+    for revoked in crl_file.get_revoked():
+        if cert.get_serial_number() == int(revoked.get_serial(), 16):
+            return True
+
+    return False
+
+
+def get_name_regex(name):
+    if name is not None:
+        return name.replace('.', r'\.').replace('*\.', r'([^.]*.)?') + '$'
+
+
+def get_hostname(netloc):
+    if ':' not in netloc:
+        return netloc
+    else:
+        return netloc[:netloc.find(':')]
+
+
+def get_port(netloc):
+    if ':' not in netloc:
+        return 'https'
+    elif netloc.find(':') == len(netloc)-1:
+        return 'https'
+    else:
+        return netloc[netloc.find(':')+1:]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Secure cURL implementation, Jordan Ebel", usage=SUPPRESS)
+    parser.add_argument('url', help='Request URL')
+    parser.add_argument('-v', dest='verbose', help='be verbose', action='store_true')
+    parser.add_argument('--tlsv1.0', dest='tlsv10', help='use TLS v1.0', action='store_true')
+    parser.add_argument('--tlsv1.1', dest='tlsv11', help='use TLS v1.1', action='store_true')
+    parser.add_argument('--tlsv1.2', dest='tlsv12', help='use TLS v1.2', action='store_true')
+    parser.add_argument('--sslv3', dest='sslv3', help='use SSL v3', action='store_true')
+    parser.add_argument('-3', dest='sslv3', help='use SSL v3', action='store_true')
+    parser.add_argument('--ciphers', dest='ciphers', help='cipher list', nargs=1)
+    parser.add_argument('--crlfile', dest='crlfile', help='CRL file', nargs=1)
+    parser.add_argument('--cacert', dest='cacert', help='CA Cert', nargs=1)
+    parser.add_argument('--allow-stale-certs', dest='stalecerts', help='CA Cert', nargs=1, type=int)
+    parser.add_argument('--pinnedpublickey', dest='pinnedpublickey', help='pinned public key', nargs=1)
+    return parser.parse_args()
+
+
+def build_request(path, hostname):
+    req = []
+    req.append('GET ')
+    if path == '':
+        req.append('/')
+    else:
+        req.append(path)
+    req.append(' HTTP/1.0\r\n')
+    req.append('Host: ' + hostname + '\r\n') 
+    req.append('User-Agent: curl/7.47.1\r\n')
+    req.append(r'Accept: */*' + '\r\n')
+    req.append('\r\n')
+    return "".join(req)
+    
+
+def verify_cert(conn, cert, errno, depth, rc):
+    common_name = cert.get_subject().commonName
+    cn_regex = get_name_regex(common_name)
+    subject_alt_name = None
+
+    # get subject alt name, if present
+    for i in range(0, cert.get_extension_count()):
+        ext = cert.get_extension(i)
+        if ext.get_short_name() == "subjectAltName":
+            subject_alt_name = ext._subjectAltNameString()
+
+    # print cert info in verbose mode
+    if args.verbose:
+        print "**************************"
+        print "errno: " + str(errno) + " depth: " + str(depth) + " rc: " + str(rc)
+        print "serial num: " + str(cert.get_serial_number())
+        print "subject: " + repr(cert.get_subject().get_components())
+        print "subjectAltName: " + str(subject_alt_name)
+        print "common name: " + str(common_name)
+        print "conn server name: " + conn.get_servername()
+        print "cn regex: " + str(cn_regex)
+        print "issuer: " + repr(cert.get_issuer().get_components())
+        print "digest: " + cert.digest(DIGEST_ALGORITHM)
+        print "not after: " + cert.get_notAfter()
+        print "not before: " + cert.get_notBefore()
+        print "num extensions: " + str(cert.get_extension_count())
+        for i in range(0, cert.get_extension_count()):
+            print cert.get_extension(i).get_short_name()
+        print "**************************\n"
+
+    # pinned public key
+    # accept if the leaf cert matches, no matter other errors
+    if args.pinnedpublickey is not None:
+        # only check leaf certificate
+        if depth is not 0:
+            return True
+
+        pinned_cert = get_certificate(args.pinnedpublickey[0])
+        return pinned_cert.digest(DIGEST_ALGORITHM) == cert.digest(DIGEST_ALGORITHM)
+    
+    # check CRL file
+    if args.crlfile is not None:
+        crl_file = get_crl_file(args.crlfile[0])
+
+        if cert_in_crl_file(cert, crl_file):
+            return False
+
+    # check for leaf cert common name match
+    if depth is 0:
+        # check common name for leaf cert
+        if cn_regex is None or re.match(cn_regex, conn.get_servername()) is None:
+            found_match = False
+
+            # check alt names for leaf cert
+            for token in subject_alt_name.split('DNS:'):
+                alt_name = token.replace(',', '').strip()
+                alt_name_regex = get_name_regex(alt_name)
+    
+                if re.match(alt_name_regex, conn.get_servername()):
+                    found_match = True
+
+            if not found_match:
+                return False
+
+    # expired
+    if errno == 10:
+        # allow-stale-certs check
+        if args.stalecerts is not None:
+            notAfter = get_datetime(cert.get_notAfter())
+            return (datetime.datetime.now() - notAfter) <= datetime.timedelta(days=args.stalecerts[0])
+
+        return False
+
+    # approve if OpenSSL library approves
+    return errno == 0
+
+
+def resolve():
+    return socket.getaddrinfo(get_hostname(url.netloc), get_port(url.netloc), socket.AF_UNSPEC, socket.SOCK_STREAM)
+
+
+def connect(conns):
+    # determine TLS method
+    if last_tls_version is None:
+        method = OpenSSL.SSL.TLSv1_2_METHOD
+    else:
+        if last_tls_version == "--tlsv1.0":
+            method = OpenSSL.SSL.TLSv1_METHOD
+        elif last_tls_version == "--tlsv1.1":
+            method = OpenSSL.SSL.TLSv1_1_METHOD
+        elif last_tls_version == "--tlsv1.2":
+            method = OpenSSL.SSL.TLSv1_2_METHOD
+        else:
+            method = OpenSSL.SSL.SSLv3_METHOD
+
+    # build SSL context
+    context = OpenSSL.SSL.Context(method)
+    context.set_options(OpenSSL.SSL.OP_NO_TICKET) # no session ticket extension
+    context.set_verify(OpenSSL.SSL.VERIFY_PEER, verify_cert)
+
+    # load CA certs
+    if args.cacert is not None:
+        context.load_verify_locations(args.cacert[0], None)
+    else:
+        context.set_default_verify_paths()
+
+    # set cipher list
+    if args.ciphers is not None:
+        context.set_cipher_list(args.ciphers[0])
+    else:
+        context.set_cipher_list(DEFAULT_CIPHER_LIST)
+
+    # build SSL socket
+    for conn in conns:
+        family, socktype, proto, canonname, addr = conn
+        try:
+            sock = socket.socket(family, socktype, proto)
+            ssl_socket = OpenSSL.SSL.Connection(context, sock)
+            ssl_socket.connect(addr)
+            ssl_socket.set_tlsext_host_name(get_hostname(url.netloc))  # SNI
+            ssl_socket.do_handshake()
+            return ssl_socket
+
+        except socket.error as err:
+            last_err = err
+
+    raise last_err
+
+
+def request(ssl_socket):
+    buffer_len = 4096
+
+    # send request
+    req = build_request(url.path, get_hostname(url.netloc))
+    ssl_socket.sendall(req)
+    if args.verbose:
+        print req
+
+    # read response
+    result = []
+    while True:
+        try:
+            buf = ssl_socket.recv(buffer_len)
+            if len(buf) == 0:
+                break
+        except:
+            break
+
+        result.append(buf)
+
+    return "".join(result)
+
+
+def print_comms(result):
+    # print everything 
+    if args.verbose:
+        print result
+
+    # do not print headers
+    else:
+        print result[result.index('\r\n\r\n')+4:].strip('\n')
+
+
+def main():
+    global args
+    global url
+    global last_tls_version
+
+    args = parse_args()
+    url = urlparse.urlparse(args.url)
+    last_tls_version = None
+
+    if args.verbose:
+        print args
+        print url
+
+    for arg in sys.argv:
+        # verify no other arguments are passed in, since argparse allows abbreviated arguments
+        if re.match('--.*', arg):
+            if arg not in DOUBLE_ALLOWED_ARGS or '=' in arg:
+                print_stderr('Argument not allowed: ' + arg)
+                sys.exit(2)
+        elif re.match('-.*', arg):
+            if arg not in SINGLE_ALLOWED_ARGS or '=' in arg:
+                print_stderr('Argument not allowed: ' + arg)
+                sys.exit(2)
+
+        # get the last TLS type from command line
+        if arg == "--tlsv1.2" or arg == "--tlsv1.1" or arg == "--tlsv1.0" or arg == "--sslv3" or arg == "-3":
+            last_tls_version = arg
+
+    # check for HTTPS scheme
+    if url.scheme != 'https':
+        print_stderr('Only HTTPS supported')
+        sys.exit(1)
+
+    # normal execution
+    else:
+        try:
+            conns = resolve()
+            ssl_socket = connect(conns)
+            result = request(ssl_socket)
+            print_comms(result)
+            error_rc = False
+
+        except socket.error as err:
+            print_stderr(err)
+            error_rc = True
+
+        except ValueError as err:
+            print_stderr('Invalid HTML header')
+            error_rc = True
+
+        except Exception as err:
+            print_stderr(err)
+            error_rc = True
+
+        except:
+            print_stderr('Unknown error')
+            error_rc = True
+        
+        finally:
+            # close socket
+            if 'ssl_socket' in locals():
+                ssl_socket.close()
+
+    # exit with return code
+    if error_rc:
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+
+
